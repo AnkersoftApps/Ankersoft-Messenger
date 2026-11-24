@@ -138,6 +138,26 @@
       font-size: 13px;
       text-align: center;
       min-height: 18px;
+      line-height: 1.4;
+    }
+
+    #auth-error.info {
+      color: var(--text-muted);
+    }
+
+    #toast {
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      transform: translateX(-50%);
+      background: var(--danger);
+      color: #fff;
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      max-width: 90vw;
+      z-index: 50;
+      display: none;
     }
 
     #app-screen {
@@ -403,12 +423,14 @@
         <button id="tab-login" type="button">Log In</button>
         <button id="tab-signup" class="secondary" type="button">Sign Up</button>
       </div>
-      <input type="text" id="auth-username" placeholder="Username (e.g. Ruzaib)" autocomplete="username" />
+      <input type="text" id="auth-username" placeholder="Username (e.g. Ruzaib)" autocomplete="username" autocapitalize="none" spellcheck="false" />
       <input type="password" id="auth-password" placeholder="Password (min 6 characters)" autocomplete="current-password" />
       <button id="auth-submit" type="button">Log In</button>
       <div id="auth-error"></div>
     </div>
   </div>
+
+  <div id="toast" role="alert"></div>
 
   <div id="app-screen">
     <div class="layout" id="main-layout">
@@ -465,20 +487,46 @@
   </div>
 
   <script>
-    const SUPABASE_URL = ""https://umuzyqsixntgjoyzmpke.supabase.co";
-    const SUPABASE_ANON_KEY = "sb_publishable_6OG71MWXXIPjwvE6AZlWJw_gQK7gwYc";
+    // ====== 1) PASTE YOUR SUPABASE VALUES HERE ======
+    // Supabase dashboard -> Project Settings -> API (or "Data API").
+    // Use the Project URL and the *anon / publishable* key. Never the service_role key.
+    const SUPABASE_URL = "YOUR_SUPABASE_URL";
+    const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
 
-    const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    // Usernames are turned into this fake email for Supabase Auth.
+    // If Supabase rejects it ("Email address ... is invalid"), type a real email
+    // (like you@gmail.com) in the username box instead - that works too.
+    const EMAIL_DOMAIN = "ankersoft.messenger";
+
+    const configured =
+      SUPABASE_URL.startsWith("http") && !SUPABASE_ANON_KEY.includes("YOUR_");
+
+    let sb = null;
+    if (configured && window.supabase) {
+      try {
+        sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+      } catch (err) {
+        console.error("Supabase init failed:", err);
+      }
+    }
 
     let authMode = "login";
+    let authBusy = false;
     let currentUser = null;
     let currentProfile = null;
     let contacts = [];
     let onlineUserIds = new Set();
     let activeContact = null;
     let mediaRecorder = null;
+    let recordingTarget = null;
     let audioChunks = [];
     let isRecording = false;
+    let bootedUserId = null;
+    let chatToken = 0;
+    let renderedIds = new Set();
+    const pendingContactAdds = new Set();
+    let searchTimer = null;
+    let toastTimer = null;
 
     const QUICK_EMOJIS = [
       "\u{1F600}", "\u{1F602}", "\u{1F525}", "\u{1F44D}",
@@ -489,7 +537,7 @@
 
     function escapeHtml(str) {
       const div = document.createElement("div");
-      div.textContent = str;
+      div.textContent = str == null ? "" : String(str);
       return div.innerHTML;
     }
 
@@ -501,6 +549,14 @@
       } catch {
         return false;
       }
+    }
+
+    function notify(message) {
+      const el = document.getElementById("toast");
+      el.textContent = message;
+      el.style.display = "block";
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { el.style.display = "none"; }, 6000);
     }
 
     function initEmojiBar() {
@@ -523,60 +579,149 @@
       document.getElementById("emoji-bar").classList.toggle("open");
     }
 
+    // ---------- AUTH ----------
+
+    function setAuthError(message, isInfo) {
+      const el = document.getElementById("auth-error");
+      el.textContent = message || "";
+      el.className = isInfo ? "info" : "";
+    }
+
     function setAuthMode(mode) {
       authMode = mode;
       document.getElementById("tab-login").className = mode === "login" ? "" : "secondary";
       document.getElementById("tab-signup").className = mode === "signup" ? "" : "secondary";
       document.getElementById("auth-submit").textContent = mode === "login" ? "Log In" : "Create Account";
-      document.getElementById("auth-error").textContent = "";
+      document.getElementById("auth-password").autocomplete =
+        mode === "login" ? "current-password" : "new-password";
+      setAuthError("");
+    }
+
+    function setAuthBusy(busy) {
+      authBusy = busy;
+      document.getElementById("auth-submit").disabled = busy;
+    }
+
+    // "ruzaib" -> ruzaib@ankersoft.messenger ; "me@gmail.com" -> used as-is
+    function resolveIdentity(raw) {
+      if (raw.includes("@")) {
+        const email = raw.toLowerCase();
+        const username = email.split("@")[0].replace(/[^a-z0-9_]/g, "");
+        return { email, username };
+      }
+      const username = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
+      return { email: `${username}@${EMAIL_DOMAIN}`, username };
+    }
+
+    function friendlyAuthError(error) {
+      const m = (error.message || "").toLowerCase();
+      if (m.includes("invalid login credentials")) {
+        return "Wrong username or password. (If you just signed up, see the note about \"Confirm email\" in the setup steps.)";
+      }
+      if (m.includes("email not confirmed")) {
+        return "This account is waiting for email confirmation. In Supabase go to Authentication > Sign In / Providers > Email and turn OFF \"Confirm email\", then sign up again with a new username.";
+      }
+      if (m.includes("already registered") || m.includes("already been registered")) {
+        return "That username is already taken.";
+      }
+      if (m.includes("database error saving new user")) {
+        return "That username is already taken (or the profiles table isn't set up yet).";
+      }
+      if (m.includes("is invalid") && m.includes("email")) {
+        return "Supabase rejected the generated email address. Type a real email (like you@gmail.com) in the username box instead.";
+      }
+      if (m.includes("rate limit")) {
+        return "Too many attempts. Wait a few minutes and try again.";
+      }
+      return error.message || "Something went wrong.";
     }
 
     async function handleAuth() {
+      if (authBusy) return;
+
+      if (!sb) {
+        setAuthError("The app isn't connected to Supabase yet. Open index.html and paste your Supabase URL and anon key at the top of the script.");
+        return;
+      }
+
       const rawUser = document.getElementById("auth-username").value.trim();
       const password = document.getElementById("auth-password").value;
-      const errEl = document.getElementById("auth-error");
-      errEl.textContent = "";
+      setAuthError("");
 
       if (!rawUser || password.length < 6) {
-        errEl.textContent = "Enter a username and at least a 6-character password.";
+        setAuthError("Enter a username and at least a 6-character password.");
         return;
       }
 
-      const cleanUsername = rawUser.toLowerCase().replace(/[^a-z0-9_]/g, "");
-      if (!cleanUsername) {
-        errEl.textContent = "Username can only contain letters, numbers, and underscores.";
+      const { email, username } = resolveIdentity(rawUser);
+      if (!username) {
+        setAuthError("Username can only contain letters, numbers, and underscores.");
         return;
       }
 
-      const accountEmail = `${cleanUsername}@ankersoft.messenger`;
-
-      if (authMode === "signup") {
-        const { data, error } = await sb.auth.signUp({ email: accountEmail, password });
-        if (error) {
-          errEl.textContent = error.message;
-          return;
-        }
-
-        if (data.user) {
-          const { error: profErr } = await sb.from("profiles").insert({
-            id: data.user.id,
-            username: rawUser
+      setAuthBusy(true);
+      try {
+        if (authMode === "signup") {
+          const { data, error } = await sb.auth.signUp({
+            email,
+            password,
+            options: { data: { username } }
           });
-          if (profErr) {
-            errEl.textContent = "Username already taken or error saving profile.";
+          if (error) {
+            setAuthError(friendlyAuthError(error));
+            return;
           }
+          if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+            setAuthError("That username is already taken.");
+            return;
+          }
+          if (!data.session) {
+            setAuthError("Account created, but Supabase is waiting for email confirmation, so you can't log in yet. Turn OFF \"Confirm email\" in Supabase (Authentication > Sign In / Providers > Email), then sign up again with a new username.", true);
+          }
+          // If a session exists, onAuthStateChange takes it from here.
+        } else {
+          const { error } = await sb.auth.signInWithPassword({ email, password });
+          if (error) setAuthError(friendlyAuthError(error));
         }
-      } else {
-        const { error } = await sb.auth.signInWithPassword({ email: accountEmail, password });
-        if (error) {
-          errEl.textContent = "Invalid username or password.";
-        }
+      } catch (err) {
+        console.error(err);
+        setAuthError("Couldn't reach Supabase. Check your internet connection and the URL/key at the top of the script.");
+      } finally {
+        setAuthBusy(false);
       }
     }
 
     async function logout() {
-      await sb.auth.signOut();
-      window.location.reload();
+      try {
+        await sb.auth.signOut();
+      } finally {
+        window.location.reload();
+      }
+    }
+
+    // ---------- PROFILE / CONTACTS ----------
+
+    async function ensureProfile(user) {
+      const { data, error } = await sb
+        .from("profiles")
+        .select("*")
+        .eq("id", user.id)
+        .maybeSingle();
+
+      if (data) return data;
+      if (error) console.error("Profile lookup failed:", error);
+
+      const fallbackName =
+        (user.user_metadata && user.user_metadata.username) ||
+        (user.email || "user").split("@")[0];
+      const row = { id: user.id, username: fallbackName };
+
+      const { error: insErr } = await sb.from("profiles").insert(row);
+      if (insErr) {
+        console.error("Profile insert failed:", insErr);
+        notify("Couldn't save your profile: " + insErr.message);
+      }
+      return row;
     }
 
     function renderContacts() {
@@ -591,7 +736,7 @@
       contacts.forEach((c) => {
         const isOnline = onlineUserIds.has(c.id);
         const div = document.createElement("div");
-        div.className = "contact-item" + (activeContact?.id === c.id ? " active" : "");
+        div.className = "contact-item" + (activeContact && activeContact.id === c.id ? " active" : "");
         div.addEventListener("click", () => {
           openChat(c);
         });
@@ -615,17 +760,52 @@
     }
 
     async function loadContacts() {
-      const { data } = await sb
+      const { data: rows, error } = await sb
         .from("contacts")
-        .select("contact_id, profiles!contacts_contact_id_fkey(id, username)")
+        .select("contact_id")
         .eq("user_id", currentUser.id);
 
-      contacts = (data || []).map((row) => row.profiles).filter(Boolean);
+      if (error) {
+        console.error("Loading contacts failed:", error);
+        notify("Couldn't load contacts: " + error.message);
+        return;
+      }
+
+      const ids = (rows || []).map((r) => r.contact_id);
+      if (ids.length === 0) {
+        contacts = [];
+        renderContacts();
+        return;
+      }
+
+      const { data: profs, error: profErr } = await sb
+        .from("profiles")
+        .select("id, username")
+        .in("id", ids)
+        .order("username");
+
+      if (profErr) {
+        console.error("Loading contact profiles failed:", profErr);
+        notify("Couldn't load contacts: " + profErr.message);
+        return;
+      }
+
+      contacts = profs || [];
       renderContacts();
     }
 
     async function addContact(user) {
-      await sb.from("contacts").insert({ user_id: currentUser.id, contact_id: user.id });
+      const { error } = await sb
+        .from("contacts")
+        .insert({ user_id: currentUser.id, contact_id: user.id });
+
+      // 23505 = already in your contacts, which is fine
+      if (error && error.code !== "23505") {
+        console.error("Adding contact failed:", error);
+        notify("Couldn't add contact: " + error.message);
+        return;
+      }
+
       document.getElementById("search-input").value = "";
       document.getElementById("search-results-section").style.display = "none";
       await loadContacts();
@@ -642,12 +822,21 @@
         return;
       }
 
-      const { data } = await sb
+      const { data, error } = await sb
         .from("profiles")
-        .select("*")
+        .select("id, username")
         .ilike("username", `%${query}%`)
         .neq("id", currentUser.id)
         .limit(8);
+
+      if (error) {
+        console.error("Search failed:", error);
+        notify("Search failed: " + error.message);
+        return;
+      }
+
+      // Ignore stale results if the box changed while we were waiting
+      if (document.getElementById("search-input").value.trim() !== query) return;
 
       section.style.display = "block";
       resultsList.innerHTML = "";
@@ -686,7 +875,14 @@
       });
     }
 
+    // ---------- MESSAGES ----------
+
     function appendMessageToFeed(msg) {
+      if (msg.id) {
+        if (renderedIds.has(msg.id)) return;
+        renderedIds.add(msg.id);
+      }
+
       const placeholder = document.getElementById("no-msg-placeholder");
       if (placeholder) placeholder.remove();
 
@@ -695,35 +891,53 @@
       const div = document.createElement("div");
       div.className = "msg-bubble " + (isMine ? "msg-mine" : "msg-theirs");
 
-      let mediaHtml = "";
+      if (msg.content) {
+        const text = document.createElement("div");
+        text.textContent = msg.content;
+        div.appendChild(text);
+      }
+
+      // Media is built with DOM properties (not innerHTML) so a crafted URL can't inject HTML.
       if (isSafeMediaUrl(msg.media_url)) {
-        const safeUrl = escapeHtml(msg.media_url);
+        const wrap = document.createElement("div");
+        wrap.className = "msg-media";
+        let el = null;
+
         if (msg.media_type === "image") {
-          mediaHtml = `<div class="msg-media"><img src="${safeUrl}" alt="Shared image" /></div>`;
+          el = document.createElement("img");
+          el.alt = "Shared image";
         } else if (msg.media_type === "video") {
-          mediaHtml = `<div class="msg-media"><video src="${safeUrl}" controls playsinline></video></div>`;
+          el = document.createElement("video");
+          el.controls = true;
+          el.playsInline = true;
         } else if (msg.media_type === "audio") {
-          mediaHtml = `<div class="msg-media"><audio src="${safeUrl}" controls></audio></div>`;
+          el = document.createElement("audio");
+          el.controls = true;
+        }
+
+        if (el) {
+          el.src = msg.media_url;
+          wrap.appendChild(el);
+          div.appendChild(wrap);
         }
       }
 
-      const timeStr = new Date(msg.created_at).toLocaleTimeString([], {
+      const time = document.createElement("div");
+      time.className = "msg-time";
+      time.textContent = new Date(msg.created_at).toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit"
       });
-
-      div.innerHTML = `
-        ${msg.content ? `<div>${escapeHtml(msg.content)}</div>` : ""}
-        ${mediaHtml}
-        <div class="msg-time">${escapeHtml(timeStr)}</div>
-      `;
+      div.appendChild(time);
 
       feed.appendChild(div);
       feed.scrollTop = feed.scrollHeight;
     }
 
     async function openChat(contact) {
+      const token = ++chatToken;
       activeContact = contact;
+      renderedIds = new Set();
       document.getElementById("main-layout").classList.add("in-chat");
       document.getElementById("active-chat-name").textContent = contact.username;
       document.getElementById("active-chat-dot").style.display = "inline-block";
@@ -733,7 +947,7 @@
       const feed = document.getElementById("messages-feed");
       feed.innerHTML = '<div class="empty-state">Loading chat...</div>';
 
-      const { data } = await sb
+      const { data, error } = await sb
         .from("messages")
         .select("*")
         .or(
@@ -741,7 +955,16 @@
         )
         .order("created_at", { ascending: true });
 
+      if (token !== chatToken) return; // user switched chats while loading
+
       feed.innerHTML = "";
+      if (error) {
+        console.error("Loading messages failed:", error);
+        feed.innerHTML = '<div class="empty-state">Couldn\'t load messages.</div>';
+        notify("Couldn't load messages: " + error.message);
+        return;
+      }
+
       if (!data || data.length === 0) {
         feed.innerHTML = `<div class="empty-state" id="no-msg-placeholder">Say hello to ${escapeHtml(contact.username)}!</div>`;
       } else {
@@ -752,6 +975,23 @@
     function closeMobileChat() {
       document.getElementById("main-layout").classList.remove("in-chat");
       activeContact = null;
+      chatToken++;
+    }
+
+    async function insertMessage(receiverId, fields) {
+      const { data, error } = await sb
+        .from("messages")
+        .insert({ sender_id: currentUser.id, receiver_id: receiverId, ...fields })
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      // Show it right away; realtime will also deliver it, and renderedIds de-dupes.
+      if (data && activeContact && activeContact.id === receiverId) {
+        appendMessageToFeed(data);
+      }
+      return data;
     }
 
     async function sendTextMessage() {
@@ -762,51 +1002,58 @@
       input.value = "";
       document.getElementById("emoji-bar").classList.remove("open");
 
-      await sb.from("messages").insert({
-        sender_id: currentUser.id,
-        receiver_id: activeContact.id,
-        content: text,
-        media_type: "text"
-      });
+      try {
+        await insertMessage(activeContact.id, { content: text, media_type: "text" });
+      } catch (err) {
+        console.error("Send failed:", err);
+        input.value = text;
+        notify("Message not sent: " + err.message);
+      }
     }
 
     async function handleFileUpload(event) {
       const file = event.target.files[0];
-      if (!file || !activeContact) return;
+      const target = activeContact;
+      if (!file || !target) return;
 
-      if (file.size > 50 * 1024 * 1024) {
-        window.alert("Please select an image or video smaller than 50 MB.");
-        return;
+      try {
+        if (file.size > 50 * 1024 * 1024) {
+          window.alert("Please select an image or video smaller than 50 MB.");
+          return;
+        }
+
+        const mediaType = file.type.startsWith("video/") ? "video" : "image";
+        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "") || "upload";
+        const filePath = `${currentUser.id}/${Date.now()}_${safeName}`;
+
+        const { error } = await sb.storage.from("chat-media").upload(filePath, file);
+        if (error) {
+          window.alert(`Upload failed: ${error.message}`);
+          return;
+        }
+
+        const { data: urlData } = sb.storage.from("chat-media").getPublicUrl(filePath);
+        await insertMessage(target.id, {
+          media_url: urlData.publicUrl,
+          media_type: mediaType
+        });
+      } catch (err) {
+        console.error("Media send failed:", err);
+        notify("Couldn't send file: " + err.message);
+      } finally {
+        event.target.value = "";
       }
-
-      const mediaType = file.type.startsWith("video/") ? "video" : "image";
-      const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "");
-      const filePath = `${currentUser.id}/${Date.now()}_${safeName}`;
-
-      const { error } = await sb.storage.from("chat-media").upload(filePath, file);
-      if (error) {
-        window.alert(`Upload failed: ${error.message}`);
-        return;
-      }
-
-      const { data: urlData } = sb.storage.from("chat-media").getPublicUrl(filePath);
-
-      await sb.from("messages").insert({
-        sender_id: currentUser.id,
-        receiver_id: activeContact.id,
-        media_url: urlData.publicUrl,
-        media_type: mediaType
-      });
-      event.target.value = "";
     }
 
     async function toggleVoiceRecord() {
       const btn = document.getElementById("record-btn");
 
       if (!isRecording) {
+        if (!activeContact) return;
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           mediaRecorder = new MediaRecorder(stream);
+          recordingTarget = activeContact;
           audioChunks = [];
 
           mediaRecorder.addEventListener("dataavailable", (e) => {
@@ -815,23 +1062,28 @@
 
           mediaRecorder.addEventListener("stop", async () => {
             stream.getTracks().forEach((t) => t.stop());
+            const target = recordingTarget;
             const mimeType = mediaRecorder.mimeType || "audio/mp4";
             const ext = mimeType.includes("webm") ? "webm" : "mp4";
             const blob = new Blob(audioChunks, { type: mimeType });
             const filePath = `${currentUser.id}/voice_${Date.now()}.${ext}`;
 
-            const { error } = await sb.storage
-              .from("chat-media")
-              .upload(filePath, blob, { contentType: mimeType });
+            try {
+              const { error } = await sb.storage
+                .from("chat-media")
+                .upload(filePath, blob, { contentType: mimeType });
+              if (error) throw error;
 
-            if (!error && activeContact) {
-              const { data: urlData } = sb.storage.from("chat-media").getPublicUrl(filePath);
-              await sb.from("messages").insert({
-                sender_id: currentUser.id,
-                receiver_id: activeContact.id,
-                media_url: urlData.publicUrl,
-                media_type: "audio"
-              });
+              if (target) {
+                const { data: urlData } = sb.storage.from("chat-media").getPublicUrl(filePath);
+                await insertMessage(target.id, {
+                  media_url: urlData.publicUrl,
+                  media_type: "audio"
+                });
+              }
+            } catch (err) {
+              console.error("Voice note failed:", err);
+              notify("Voice note not sent: " + err.message);
             }
           });
 
@@ -847,6 +1099,22 @@
         isRecording = false;
         btn.classList.remove("recording");
         btn.innerHTML = "&#127908;";
+      }
+    }
+
+    // ---------- REALTIME + PRESENCE ----------
+
+    async function ensureContactFromIncoming(senderId) {
+      if (contacts.some((c) => c.id === senderId) || pendingContactAdds.has(senderId)) return;
+      pendingContactAdds.add(senderId);
+      try {
+        const { error } = await sb
+          .from("contacts")
+          .insert({ user_id: currentUser.id, contact_id: senderId });
+        if (error && error.code !== "23505") console.error("Auto-add contact failed:", error);
+        await loadContacts();
+      } finally {
+        pendingContactAdds.delete(senderId);
       }
     }
 
@@ -879,12 +1147,8 @@
             const involvesMe = msg.sender_id === currentUser.id || msg.receiver_id === currentUser.id;
             if (!involvesMe) return;
 
-            if (msg.sender_id !== currentUser.id && !contacts.some((c) => c.id === msg.sender_id)) {
-              await sb.from("contacts").insert({
-                user_id: currentUser.id,
-                contact_id: msg.sender_id
-              });
-              await loadContacts();
+            if (msg.sender_id !== currentUser.id) {
+              await ensureContactFromIncoming(msg.sender_id);
             }
 
             if (
@@ -898,46 +1162,80 @@
         .subscribe();
     }
 
-    sb.auth.onAuthStateChange(async (_event, session) => {
-      if (session?.user) {
-        currentUser = session.user;
-        const { data: prof } = await sb
-          .from("profiles")
-          .select("*")
-          .eq("id", currentUser.id)
-          .single();
+    // ---------- STARTUP ----------
 
-        currentProfile = prof || {
-          id: currentUser.id,
-          username: currentUser.email.split("@")[0]
-        };
+    async function bootApp(user) {
+      currentUser = user;
+      currentProfile = await ensureProfile(user);
 
-        document.getElementById("auth-screen").style.display = "none";
-        document.getElementById("app-screen").style.display = "block";
-        document.getElementById("current-user-label").textContent = `@${currentProfile.username}`;
+      document.getElementById("auth-screen").style.display = "none";
+      document.getElementById("app-screen").style.display = "block";
+      document.getElementById("current-user-label").textContent = `@${currentProfile.username}`;
 
-        await loadContacts();
-        setupRealtimeAndPresence();
-      }
-    });
+      await loadContacts();
+      setupRealtimeAndPresence();
+    }
 
-    initEmojiBar();
-    document.getElementById("tab-login").addEventListener("click", () => setAuthMode("login"));
-    document.getElementById("tab-signup").addEventListener("click", () => setAuthMode("signup"));
-    document.getElementById("auth-submit").addEventListener("click", handleAuth);
-    document.getElementById("logout-btn").addEventListener("click", logout);
-    document.getElementById("search-input").addEventListener("input", searchUsers);
-    document.getElementById("back-btn").addEventListener("click", closeMobileChat);
-    document.getElementById("emoji-toggle-btn").addEventListener("click", toggleEmojis);
-    document.getElementById("attach-btn").addEventListener("click", () => {
-      document.getElementById("media-input").click();
-    });
-    document.getElementById("media-input").addEventListener("change", handleFileUpload);
-    document.getElementById("record-btn").addEventListener("click", toggleVoiceRecord);
-    document.getElementById("send-btn").addEventListener("click", sendTextMessage);
-    document.getElementById("msg-input").addEventListener("keydown", (event) => {
-      if (event.key === "Enter") sendTextMessage();
-    });
+    // Runs once per signed-in user. supabase-js fires SIGNED_IN / TOKEN_REFRESHED again
+    // (e.g. whenever the tab regains focus), which would otherwise duplicate every listener.
+    function startApp(user) {
+      if (bootedUserId === user.id) return;
+      bootedUserId = user.id;
+      // setTimeout(0) matters: awaiting Supabase calls directly inside onAuthStateChange can
+      // deadlock supabase-js, which is the "login hangs forever" bug.
+      setTimeout(() => {
+        bootApp(user).catch((err) => {
+          console.error("Startup failed:", err);
+          notify("Something went wrong loading your account: " + err.message);
+        });
+      }, 0);
+    }
+
+    function wireUpUi() {
+      initEmojiBar();
+      document.getElementById("tab-login").addEventListener("click", () => setAuthMode("login"));
+      document.getElementById("tab-signup").addEventListener("click", () => setAuthMode("signup"));
+      document.getElementById("auth-submit").addEventListener("click", handleAuth);
+      ["auth-username", "auth-password"].forEach((id) => {
+        document.getElementById(id).addEventListener("keydown", (event) => {
+          if (event.key === "Enter") handleAuth();
+        });
+      });
+      document.getElementById("logout-btn").addEventListener("click", logout);
+      document.getElementById("search-input").addEventListener("input", () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(searchUsers, 250);
+      });
+      document.getElementById("back-btn").addEventListener("click", closeMobileChat);
+      document.getElementById("emoji-toggle-btn").addEventListener("click", toggleEmojis);
+      document.getElementById("attach-btn").addEventListener("click", () => {
+        document.getElementById("media-input").click();
+      });
+      document.getElementById("media-input").addEventListener("change", handleFileUpload);
+      document.getElementById("record-btn").addEventListener("click", toggleVoiceRecord);
+      document.getElementById("send-btn").addEventListener("click", sendTextMessage);
+      document.getElementById("msg-input").addEventListener("keydown", (event) => {
+        if (event.key === "Enter") sendTextMessage();
+      });
+    }
+
+    // UI is wired first so the buttons always respond, even if Supabase isn't configured.
+    wireUpUi();
+
+    if (!sb) {
+      setAuthError(
+        window.supabase
+          ? "Not connected: open index.html and paste your Supabase URL and anon key at the top of the script."
+          : "Couldn't load the Supabase library. Check your internet connection and reload."
+      );
+    } else {
+      sb.auth.onAuthStateChange((event, session) => {
+        if (session && session.user) startApp(session.user);
+      });
+      sb.auth.getSession().then(({ data }) => {
+        if (data && data.session) startApp(data.session.user);
+      });
+    }
   </script>
 </body>
 </html>
